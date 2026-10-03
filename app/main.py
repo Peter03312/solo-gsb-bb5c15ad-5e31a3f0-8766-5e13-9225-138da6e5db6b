@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from .config import get_settings
 from .db import Database
-from .schemas import CoOccupancyQuery, CorrectionBatch, PointBatch, ProximityQuery, RiskBudgetQuery, ZoneCreate
+from .schemas import CoOccupancyQuery, CorrectionBatch, PointBatch, ProximityQuery, RiskBudgetQuery, SpeedingReviewQuery, ZoneCreate
 from .service import AuditService, ConflictError, NotFoundError, ValidationError
 
 settings = get_settings()
@@ -26,7 +26,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
     description=(
         "登记带洞米制多边形危险区及其 UTC 半开生效时段；每次登记原子产生全局递增修订号，"
@@ -42,6 +42,10 @@ app = FastAPI(
         "单车危险区风险预算复核按同一已提交读视图核算一次作业内各区占用，"
         "重叠区域同时占用只按最高权重计入，返回恒权重区间、各段与总计加权秒数"
         "及累计值首次达到预算的时刻。"
+        "单车危险区超速复核按同一已提交读视图核算相邻点线性轨迹的恒定速度，"
+        "点间隔超过上限的整段视为无覆盖，重叠区域按最低限速，"
+        "返回按时序切分的超速正时长区间（每段速度、适用限速与并列限速区）、"
+        "实际使用的版本号、违规总时长与超速距离总量。"
     ),
 )
 
@@ -87,6 +91,7 @@ def index() -> dict:
             "POST /api/v1/zones/{zone_id}/co-occupancy",
             "POST /api/v1/zones/{zone_id}/proximity",
             "POST /api/v1/trips/{trip_id}/risk-budget",
+            "POST /api/v1/trips/{trip_id}/speeding-review",
         ],
     }
 
@@ -250,6 +255,15 @@ def query_risk_budget(trip_id: str, body: RiskBudgetQuery) -> dict:
     重叠区域同时占用只按最高权重计入，返回恒权重正时长区间、各段与总计加权秒数，
     以及累计加权秒数首次达到预算的时刻。"""
     return service.query_risk_budget(trip_id, body.model_dump())
+
+
+@app.post("/api/v1/trips/{trip_id}/speeding-review")
+def query_speeding_review(trip_id: str, body: SpeedingReviewQuery) -> dict:
+    """单车危险区内超速时段复核：区域配置与车次有效点集从同一已提交读视图读取，
+    相邻点按线性轨迹计算恒定速度，点间隔超过上限的整段视为无覆盖，重叠区域按最低限速，
+    速度严格大于限速才违规；返回按时序切分的违规正时长区间（每段速度、适用限速与
+    并列限速区 ID）、实际使用的区域修订号与轨迹版本，以及违规总时长与超速距离总量。"""
+    return service.query_speeding_review(trip_id, body.model_dump())
 
 
 if __name__ == "__main__":

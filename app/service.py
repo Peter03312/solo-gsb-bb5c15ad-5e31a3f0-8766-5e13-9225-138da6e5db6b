@@ -1020,6 +1020,220 @@ class AuditService:
         return result
 
     # ------------------------------------------------------------------
+    # 单车危险区内超速时段复核
+    # ------------------------------------------------------------------
+
+    def _validate_zone_speed_limits(self, raw: Any) -> Dict[str, float]:
+        """校验危险区 ID -> 正且有限限速（米/秒）的非空映射（非法值 400）。"""
+        if not isinstance(raw, dict) or not raw:
+            raise ValidationError(
+                "zone_speed_limits 必须是非空 {危险区 ID: 正且有限限速（米/秒）} 映射"
+            )
+        limits: Dict[str, float] = {}
+        for zone_id, v_raw in raw.items():
+            if not isinstance(zone_id, str) or not zone_id.strip():
+                raise ValidationError(
+                    f"zone_speed_limits 的危险区 ID 必须是非空字符串，收到: {zone_id!r}"
+                )
+            zid = zone_id.strip()
+            limits[zid] = self._validate_positive_finite(
+                v_raw, f"zone_speed_limits[{zid!r}] 限速（米/秒）"
+            )
+        return limits
+
+    def query_speeding_review(self, trip_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """复核单车在给定危险区内的超速时段。
+
+        - 输入：车次、带时区 UTC 半开查询时段、非空危险区 ID→正且有限限速（米/秒）映射、
+          正且有限最大采样间隔（秒），可选区域修订号与轨迹版本；
+        - 区域（含指定修订号）与车次有效点（含指定/最新版本）从**同一已提交读视图**读取；
+        - 相邻点按线性轨迹计算恒定速度（距离/间隔）；点间隔严格大于上限的整段视为无覆盖；
+        - 仅当该时刻位于所选区几何内（外边界计入、洞及其边界不计）且区域生效时计入，
+          重叠区域按最低限速；速度**严格大于**适用限速才违规，零时长接触不计；
+        - 返回按时序切分的违规正时长区间（每段速度、适用限速、并列限速区 ID）、
+          实际使用的区域修订号与轨迹版本，以及违规总时长与超速距离总量
+          （Σ(速度-限速)×时长）；无违规返回空区间与零总量。
+        """
+        if not isinstance(trip_id, str) or not trip_id.strip():
+            raise ValidationError("trip_id 必须是非空字符串")
+        trip_id = trip_id.strip()
+
+        try:
+            lo = parse_utc(payload.get("since"), field="since").timestamp()
+            hi = parse_utc(payload.get("until"), field="until").timestamp()
+        except TimeError as exc:
+            raise ValidationError(str(exc)) from exc
+        if lo >= hi:
+            raise ValidationError("since 必须早于 until（查询范围为半开 [since, until)）")
+
+        zone_limits = self._validate_zone_speed_limits(payload.get("zone_speed_limits"))
+        max_gap = self._validate_positive_finite(
+            payload.get("max_sample_interval_sec"), "max_sample_interval_sec 最大采样间隔（秒）"
+        )
+
+        pinned_rev = payload.get("revision") is not None
+        revision = (
+            _validate_revision_param(payload.get("revision")) if pinned_rev else None
+        )
+
+        pinned_track = payload.get("track_version") is not None
+        track_version = (
+            self._validate_track_version_value(payload.get("track_version"))
+            if pinned_track
+            else None
+        )
+
+        # ---- 同一已提交读视图：区域配置 + 车次点集一次快照读取 ----
+        used_version = track_version  # 指定轨迹版本时原样回填
+        with self.db.read_view() as conn:
+            if pinned_track:
+                baseline, head = self.db._trip_version_info(conn, trip_id)
+                self._check_track_version_range(trip_id, track_version, baseline, head)
+                points = self.db._list_trip_point_version_rows(conn, trip_id, track_version)
+            else:
+                vrow = self.db._trip_version_row(conn, trip_id)
+                points = self.db._list_trip_points(conn, trip_id)
+                if vrow is None and not points:
+                    raise NotFoundError(f"车次不存在（无轨迹数据）: {trip_id}")
+                used_version = 0 if vrow is None else int(vrow["version"])
+
+            if pinned_rev:
+                head_rev = self.db._current_revision(conn)
+                if revision > head_rev:
+                    raise NotFoundError(
+                        f"修订号 {revision} 超出当前范围：当前最新修订号为 {head_rev}"
+                        + ("（尚无任何区域登记）" if head_rev == 0 else "")
+                    )
+                used_revision = revision
+            else:
+                used_revision = self.db._current_revision(conn)
+
+            # 逐区取截至修订号的最后配置（未指定取最新）；未知区/该版本尚未登记明确拒绝
+            zone_data: Dict[str, Dict[str, Any]] = {}
+            for zid in zone_limits:
+                if pinned_rev:
+                    zrow = self.db._zone_row_at(conn, zid, revision)
+                    if zrow is None:
+                        raise NotFoundError(
+                            f"修订号 {revision} 的配置中危险区尚未登记: {zid}"
+                        )
+                else:
+                    zrow = self.db._latest_zone_row(conn, zid)
+                    if zrow is None:
+                        raise NotFoundError(f"危险区不存在: {zid}")
+                zone_data[zid] = self._prepare_zone(zrow)
+
+        # ---- 逐相邻点段求“区内且生效”的覆盖子区间（点间隔超限整段无覆盖）----
+        # cover_pieces: [start, end, speed, {zone_id, ...}]
+        cover_pieces: List[List[Any]] = []
+        for a, b in zip(points, points[1:]):
+            t0, t1 = a["ts_epoch"], b["ts_epoch"]
+            if t1 <= t0:
+                # 同刻点不应出现（唯一约束），稳妥跳过
+                continue
+            dt = t1 - t0
+            if dt > max_gap:
+                # 点间隔超过最大采样间隔：整段视为无覆盖
+                continue
+            speed = math.hypot(b["x"] - a["x"], b["y"] - a["y"]) / dt
+            for zid, zdata in zone_data.items():
+                params = segment_inside_params(
+                    zdata["polygon"], (a["x"], a["y"]), (b["x"], b["y"])
+                )
+                for pa, pb in params:
+                    # 参数 0/1 直接取端点时刻，保证相邻段在公共采样点精确相接
+                    s = t0 if pa == 0.0 else t0 + pa * dt
+                    e = t1 if pb == 1.0 else t0 + pb * dt
+                    # 区域 UTC 半开生效窗口 ∩ 查询半开范围
+                    ivs = clip_intervals_halfopen([(s, e)], zdata["windows"])
+                    bounds = [(lo, hi)]
+                    ivs = clip_intervals_halfopen(ivs, bounds)
+                    for cs, ce in ivs:
+                        cover_pieces.append([cs, ce, speed, zid])
+
+        # ---- 扫描线：每个正时长原子段内速度与适用限速（最低限速）恒定 ----
+        cuts = {t for s, e, _v, _z in cover_pieces for t in (s, e)}
+        events = sorted(cuts)
+        # violations: [start, end, speed, limit, tied_zone_ids]
+        violations: List[List[Any]] = []
+        for a, b in zip(events, events[1:]):
+            if b - a <= self.min_duration:
+                continue  # 零时长接触不计
+            mid = (a + b) / 2.0
+            active = {
+                zid for s, e, _v, zid in cover_pieces if s <= mid < e
+            }
+            if not active:
+                continue
+            # 同一相邻点段内速度恒定；取任一覆盖该区的片段速度即可
+            speed = next(v for s, e, v, zid in cover_pieces if s <= mid < e)
+            limit = min(zone_limits[zid] for zid in active)
+            tied = sorted(zid for zid in active if zone_limits[zid] == limit)
+            if speed <= limit:
+                continue  # 必须严格大于限速才违规
+            # 相接（1e-6 秒容差）且速度/限速/并列限速区集合一致的区间合并
+            if (
+                violations
+                and violations[-1][2] == speed
+                and violations[-1][3] == limit
+                and violations[-1][4] == tied
+                and a - violations[-1][1] <= 1e-6
+            ):
+                violations[-1][1] = b
+            else:
+                violations.append([a, b, speed, limit, tied])
+
+        violations = [v for v in violations if v[1] - v[0] > self.min_duration]
+
+        segments: List[Dict[str, Any]] = []
+        total_duration = 0.0
+        total_excess_distance = 0.0
+        for s, e, speed, limit, tied in violations:
+            duration = e - s
+            excess_distance = (speed - limit) * duration
+            total_duration += duration
+            total_excess_distance += excess_distance
+            segments.append(
+                {
+                    "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
+                    "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
+                    "duration_sec": round(duration, 6),
+                    "speed_mps": speed,
+                    "speed_limit_mps": limit,
+                    "zone_ids": list(tied),
+                    "excess_distance_m": round(excess_distance, 6),
+                }
+            )
+
+        return {
+            "trip_id": trip_id,
+            "since": _iso_z(datetime.fromtimestamp(lo, timezone.utc)),
+            "until": _iso_z(datetime.fromtimestamp(hi, timezone.utc)),
+            "zone_speed_limits": dict(zone_limits),
+            "max_sample_interval_sec": max_gap,
+            "point_count": len(points),
+            "segments": segments,
+            "total_violation_duration_sec": round(total_duration, 6),
+            "total_excess_distance_m": round(total_excess_distance, 6),
+            "revision": used_revision,
+            "track_version": used_version,
+        }
+
+    @staticmethod
+    def _prepare_zone(zrow: Any) -> Dict[str, Any]:
+        """解析一行区域修订为超速/占用计算所需的多边形与合并后生效窗口。"""
+        windows_raw = json.loads(zrow["windows"])
+        return {
+            "polygon": Polygon(
+                json.loads(zrow["exterior"]),
+                json.loads(zrow["holes"]),
+            ),
+            "windows": merge_windows(
+                [(w["start_epoch"], w["end_epoch"]) for w in windows_raw]
+            ),
+        }
+
+    # ------------------------------------------------------------------
     # 多车同时占用审计
     # ------------------------------------------------------------------
 

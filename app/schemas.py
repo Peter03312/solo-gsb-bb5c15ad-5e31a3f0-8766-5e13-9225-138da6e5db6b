@@ -134,6 +134,37 @@ class RiskBudgetQuery(BaseModel):
     )
 
 
+class SpeedingReviewQuery(BaseModel):
+    """单车危险区内超速时段复核请求。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    since: str = Field(..., description="查询起始 UTC ISO 8601（含），必须带时区")
+    until: str = Field(..., description="查询结束 UTC ISO 8601（不含），必须带时区")
+    zone_speed_limits: Dict[
+        Annotated[str, Field(min_length=1)],
+        Annotated[float, Field(gt=0, strict=True, allow_inf_nan=False)],
+    ] = Field(
+        ...,
+        min_length=1,
+        description="非空危险区 ID -> 正且有限限速（米/秒）映射；仅这些区参与核算",
+    )
+    max_sample_interval_sec: Annotated[
+        float, Field(gt=0, strict=True, allow_inf_nan=False)
+    ] = Field(
+        ...,
+        description="正且有限的最大采样间隔（秒）：相邻点间隔超过该值的整段视为无覆盖",
+    )
+    revision: Optional[int] = Field(
+        default=None, ge=1, description="可选区域修订号：按截至该号的区域配置核算"
+    )
+    track_version: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="可选轨迹版本号：按该版本保留的有效点集核算，响应回填实际使用版本",
+    )
+
+
 class ProximityQuery(BaseModel):
     """危险区内近距离相遇复核请求：两车同时位于区内且平面距离严格小于阈值的时段。"""
 
